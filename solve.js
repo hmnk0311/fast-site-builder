@@ -69,10 +69,30 @@ function slugify(text) {
   return v;
 }
 
-/** `slug` made unique against `taken` (and added to it). */
+/** `slug` made unique against `taken` (and added to it). The next
+ * suffix to try for each base is remembered per taken-set: every slot
+ * below it was taken when probed and `taken` only grows, so the first
+ * free slot is never below it and the answer matches a fresh scan
+ * from 2 — without the quadratic probing when many pages share a
+ * title (or a document repeats a heading). */
+const slugNext = new WeakMap();
 function uniqueSlug(slug, taken) {
-  let out = slug;
-  for (let n = 2; taken.has(out); n++) out = `${slug}-${n}`;
+  if (!taken.has(slug)) {
+    taken.add(slug);
+    return slug;
+  }
+  let counters = slugNext.get(taken);
+  if (counters === undefined) {
+    counters = new Map();
+    slugNext.set(taken, counters);
+  }
+  let n = counters.get(slug) ?? 2;
+  let out = `${slug}-${n}`;
+  while (taken.has(out)) {
+    n++;
+    out = `${slug}-${n}`;
+  }
+  counters.set(slug, n + 1);
   taken.add(out);
   return out;
 }
@@ -327,26 +347,31 @@ const INTEREST_RE = /[\\`*\[&<>"']/g;
  * a "**" run is not a single star: that one case uses findSingleStar.
  */
 function inline(s, env) {
-  const hasBs = s.indexOf('\\') !== -1;
+  INTEREST_RE.lastIndex = 0;
+  let m = INTEREST_RE.exec(s);
+  if (m === null) return s; // nothing to escape, nothing to render
+  // Whether the text holds a backslash decides the closer scans, but
+  // most inline text never reaches a construct that cares: scan for
+  // it only when a `*` or `[` (or the backslash itself) shows up.
+  let hasBs = -1;
+  const bs = () => {
+    if (hasBs === -1) hasBs = s.indexOf('\\') === -1 ? 0 : 1;
+    return hasBs === 1;
+  };
   const parts = [];
   const n = s.length;
   let i = 0;
-  while (i < n) {
-    INTEREST_RE.lastIndex = i;
-    const m = INTEREST_RE.exec(s);
-    if (m === null) {
-      parts.push(s.slice(i));
-      break;
-    }
+  while (m !== null) {
     const j = m.index;
     const c = m[0];
     if (j > i) parts.push(s.slice(i, j));
     if (c === '&' || c === '<' || c === '>' || c === '"' || c === "'") {
       parts.push(ESC_MAP[c]);
       i = j + 1;
-      continue;
+      { INTEREST_RE.lastIndex = i; m = INTEREST_RE.exec(s); continue; }
     }
     if (c === '\\') {
+      hasBs = 1;
       if (j + 1 < n && ESCAPABLE.has(s[j + 1])) {
         parts.push(escapeChar(s[j + 1]));
         i = j + 2;
@@ -354,7 +379,7 @@ function inline(s, env) {
         parts.push('\\');
         i = j + 1;
       }
-      continue;
+      { INTEREST_RE.lastIndex = i; m = INTEREST_RE.exec(s); continue; }
     }
     if (c === '`') {
       const k = s.indexOf('`', j + 1);
@@ -365,11 +390,11 @@ function inline(s, env) {
         parts.push('`');
         i = j + 1;
       }
-      continue;
+      { INTEREST_RE.lastIndex = i; m = INTEREST_RE.exec(s); continue; }
     }
     if (c === '*') {
       if (s[j + 1] === '*') {
-        const k = hasBs ? findUnescaped(s, '**', j + 2) : s.indexOf('**', j + 2);
+        const k = bs() ? findUnescaped(s, '**', j + 2) : s.indexOf('**', j + 2);
         if (k > j + 2) {
           parts.push('<strong>', inline(s.slice(j + 2, k), env), '</strong>');
           i = k + 2;
@@ -377,10 +402,10 @@ function inline(s, env) {
           parts.push('**');
           i = j + 2;
         }
-        continue;
+        { INTEREST_RE.lastIndex = i; m = INTEREST_RE.exec(s); continue; }
       }
-      let k = hasBs ? findSingleStar(s, j + 1) : s.indexOf('*', j + 1);
-      if (!hasBs && k !== -1 && s[k + 1] === '*') k = findSingleStar(s, j + 1);
+      let k = bs() ? findSingleStar(s, j + 1) : s.indexOf('*', j + 1);
+      if (!bs() && k !== -1 && s[k + 1] === '*') k = findSingleStar(s, j + 1);
       if (k > j + 1) {
         parts.push('<em>', inline(s.slice(j + 1, k), env), '</em>');
         i = k + 1;
@@ -388,20 +413,23 @@ function inline(s, env) {
         parts.push('*');
         i = j + 1;
       }
-      continue;
+      { INTEREST_RE.lastIndex = i; m = INTEREST_RE.exec(s); continue; }
     }
     // c === '['
-    const k = hasBs ? findUnescaped(s, ']', j + 1) : s.indexOf(']', j + 1);
+    const k = bs() ? findUnescaped(s, ']', j + 1) : s.indexOf(']', j + 1);
     const mm = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
     const target = mm === -1 ? '' : s.slice(k + 2, mm);
     if (target !== '' && !/\s/.test(target)) {
       parts.push('<a href="', escapeHtml(env.link(target)), '">', inline(s.slice(j + 1, k), env), '</a>');
       i = mm + 1;
-      continue;
+      { INTEREST_RE.lastIndex = i; m = INTEREST_RE.exec(s); continue; }
     }
     parts.push('[');
     i = j + 1;
+    INTEREST_RE.lastIndex = i;
+    m = INTEREST_RE.exec(s);
   }
+  parts.push(s.slice(i));
   return parts.join('');
 }
 
