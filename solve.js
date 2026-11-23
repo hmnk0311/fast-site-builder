@@ -36,6 +36,38 @@ const MARK_RE = /\p{M}/gu;
 /** The slug of `text`, the reference's rule (NFKD, marks dropped, A-Z
  * lowered, runs of anything but a-z/0-9 one "-", cut at 64). */
 function slugifyRaw(text) {
+  // ASCII fast path: NFKD and mark-stripping are the identity on
+  // ASCII, so the slug is built in one charCode pass. Anything
+  // non-ASCII falls back to the full Unicode path below.
+  let ascii = true;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) > 127) { ascii = false; break; }
+  }
+  if (ascii) {
+    let out = '';
+    let gap = false;
+    for (let i = 0; i < text.length; i++) {
+      const code = text.charCodeAt(i);
+      let keep = -1;
+      if (code >= 65 && code <= 90) keep = code + 32;
+      else if ((code >= 97 && code <= 122) || (code >= 48 && code <= 57)) keep = code;
+      if (keep === -1) {
+        gap = out.length > 0;
+        continue;
+      }
+      if (gap) {
+        out += '-';
+        if (out.length > SLUG_MAX) break;
+      }
+      gap = false;
+      out += String.fromCharCode(keep);
+      if (out.length > SLUG_MAX) break;
+    }
+    // `out` stopped once it passed the cap: its first SLUG_MAX
+    // characters are already final, exactly what the slice keeps.
+    out = out.slice(0, SLUG_MAX).replace(/-+$/, '');
+    return out === '' ? 'untitled' : out;
+  }
   const plain = text.normalize('NFKD').replace(MARK_RE, '');
   let out = '';
   let gap = false;
@@ -827,7 +859,14 @@ function wordsOf(text) {
   let n = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
-    if (isWsCode(text.charCodeAt(i))) inWord = false;
+    const code = text.charCodeAt(i);
+    // The whitespace test inlined, with the ASCII range (space and
+    // \\t-\\r) answered directly: body text is almost all ASCII, and
+    // a function call per character was the counter's whole cost.
+    const ws = code < 128
+      ? code === 32 || (code >= 9 && code <= 13)
+      : isWsCode(code);
+    if (ws) inWord = false;
     else if (!inWord) {
       inWord = true;
       n++;
@@ -930,6 +969,12 @@ export function run(input) {
   // 4. Markdown, links resolved against pages and static files.
   const staticPaths = new Set(statics.map((f) => f.path));
   const broken = new Set();
+  // Successful resolutions are pure in (directory, target) and the
+  // same targets recur across a directory's pages; broken ones are
+  // not cached, because each source that links one must record its
+  // own report line.
+  const linkCache = new Map(); // dir -> (target -> href): nested maps,
+  // so no separator character can collide two different pairs.
   for (const s of kept) {
     const dir = dirOf(s.path);
     const env = {
@@ -950,12 +995,25 @@ export function run(input) {
           }
           if (scheme) return target;
         }
+        let byTarget = linkCache.get(dir);
+        const cached = byTarget?.get(target);
+        if (cached !== undefined) return cached;
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
         const path = rel === '' ? null : resolvePath(dir, rel);
-        if (path !== null && bySource.has(path)) return `${bySource.get(path).url}${frag}`;
-        if (path !== null && staticPaths.has(path)) return `${base}/${path}${frag}`;
+        if (path !== null && bySource.has(path)) {
+          const href = `${bySource.get(path).url}${frag}`;
+          if (byTarget === undefined) linkCache.set(dir, (byTarget = new Map()));
+          byTarget.set(target, href);
+          return href;
+        }
+        if (path !== null && staticPaths.has(path)) {
+          const href = `${base}/${path}${frag}`;
+          if (byTarget === undefined) linkCache.set(dir, (byTarget = new Map()));
+          byTarget.set(target, href);
+          return href;
+        }
         broken.add(`broken-link ${s.path} -> ${target}`);
         return target;
       },
@@ -1022,7 +1080,9 @@ export function run(input) {
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
     reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+    // One link record per tag, interned on the shared tag object:
+    // the same record serves every card that carries the tag.
+    tags: s.tagRefs.map((t) => t.link ?? (t.link = { name: t.name, slug: t.slug, url: t.url })),
   });
   const cards = new Map(posts.map((p) => [p, cardOf(p)]));
   const pageOf = (s) => ({
